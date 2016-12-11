@@ -1,0 +1,445 @@
+<?php
+
+/**
+ * @file
+ * Contains ww_migrate_drupal.module.
+ */
+use Drupal\Core\Routing\RouteMatchInterface;
+use \Drupal\node\Entity\Node;
+use \Drupal\taxonomy\Entity\Term;
+use \Drupal\file\Entity\File;
+use \Drupal\user\Entity\User;
+use \Drupal\Core\File\FileSystem;
+
+/**
+ * Set env to UTF-8
+ */
+setlocale(LC_ALL,'en_US.UTF-8');
+
+/**
+ * Implements hook_help().
+ */
+function ww_migrate_drupal_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the ww_migrate_drupal module.
+    case 'help.page.ww_migrate_drupal':
+      $output = '';
+      $output .= '<h3>'.t('About').'</h3>';
+      $output .= '<p>'.t('This module provide a solution to import data from Drupal 7 to Drupal 8.<br />When your import is completed, disable the WW Migrate Drupal module into the Drupal 8 Backend.<br />Please have a look to the README file inside the module folder to understand how to use it.').'</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+* Call back function drush_ww_migrate_drupal_import_drupal()
+* The call back function name in the following format
+*   drush_{module_name}_{item_id_for_command}()
+*/
+function drush_ww_migrate_drupal_import_drupal() {
+  if(drush_confirm('Are you sure to launch a Drupal 7 import?')):
+    drush_print('Drupal 7 import started!');
+
+    if(drush_confirm('Did you have created and imported the Drupal 7 database?')):
+      $database = drush_prompt(dt('All right, can you tell me the Drupal 7 database name please?'));
+      $host = drush_prompt(dt('The sql host please?'));
+      $user = drush_prompt(dt('The sql user please?'));
+      $password = drush_prompt(dt('The sql password please?'));
+      drush_print(dt('I will check the connexion with the database "@database"...', array('@database' =>  $database)));
+      ww_migrate_drupal_check_database($database,$host,$user,$password);
+    else:
+      drush_log('Please, create and import the Drupal 7 database before to start your import.', 'warning');
+      drush_user_abort();
+    endif;
+  else:
+    drush_print('Drupal 7 import cancelled.');
+    drush_user_abort();
+  endif;
+}
+
+/**
+* Function ww_migrate_drupal_check_database()
+*/
+function ww_migrate_drupal_check_database($database,$host,$user,$password) {
+  try {
+    $drupal = new PDO('mysql:host='.$host.';dbname='.$database, $user, $password);
+    $drupal->exec("SET CHARACTER SET utf8");
+    drush_log('The connexion to the database is a success!', 'ok');
+    $drupal = NULL;
+
+    $setups = array ('database' => $database,
+                    'host'     => $host,
+                    'user'     => $user,
+                    'password' => $password);
+
+    ww_migrate_drupal_menu($setups);
+  } catch (PDOException $error) {
+    drush_log('The connexion to the Drupal 7 database failed.', 'error');
+    drush_user_abort();
+  }
+}
+
+/**
+* Function ww_migrate_drupal_menu()
+*/
+function ww_migrate_drupal_menu($setups) {
+  $options = array(
+    'user'             => 'Users',
+    'faq'             => 'FAQ',
+    'content'         => 'Content',
+  );
+
+  $choice = drush_choice($options, dt('What do you want to import?'));
+
+  if($choice):
+    drush_print(dt('You have chosen to import @choice.', array('@choice' => $options[$choice])));
+
+    switch($choice) {
+      case 'user':
+        ww_migrate_drupal_prepare_user($setups);
+      case 'faq':
+        ww_migrate_drupal_prepare_faq($setups);
+      case 'content':
+        ww_migrate_drupal_prepare_content($setups);
+    }
+  endif;
+}
+
+/**
+* Function ww_migrate_drupal_prepare_user()
+*/
+function ww_migrate_drupal_prepare_user($setups) {
+  try {
+    $drupal = new PDO('mysql:host='.$setups['host'].';dbname='.$setups['database'], $setups['user'], $setups['password']);
+    $drupal->exec("SET CHARACTER SET utf8");
+
+    $stmt = $drupal->prepare('SELECT DISTINCT
+                              u.name AS username,
+                              u.mail,
+                              u.created,
+                              u.language,
+                              u.timezone,
+                              GROUP_CONCAT(DISTINCT(jb.field_job_title_value) SEPARATOR ",") AS jobtitle,
+                              GROUP_CONCAT(DISTINCT(fn.field_first_name_value)SEPARATOR ",") AS firstname,
+                              GROUP_CONCAT(DISTINCT(ln.field_last_name_value) SEPARATOR ",") AS lastname,
+                              GROUP_CONCAT(DISTINCT(r.name) SEPARATOR ",") AS roles
+                              FROM users AS u
+                              LEFT OUTER JOIN users_roles AS ur ON ur.uid = u.uid
+                              LEFT OUTER JOIN role AS r ON r.rid = ur.rid
+                              LEFT OUTER JOIN profile AS p ON p.uid = u.uid
+                              LEFT OUTER JOIN field_data_field_job_title AS jb ON jb.entity_id = p.pid
+                              LEFT OUTER JOIN field_data_field_first_name AS fn ON fn.entity_id = p.pid
+                              LEFT OUTER JOIN field_data_field_last_name AS ln ON ln.entity_id = p.pid
+                              LEFT OUTER JOIN field_data_field_prefix AS pf ON pf.entity_id = p.pid
+                              LEFT OUTER JOIN taxonomy_term_data AS td ON td.tid = pf.field_prefix_tid
+                              WHERE u.status = 1
+                              GROUP BY u.name
+                              ORDER BY u.name
+                              DESC;
+                            ');
+
+    $stmt->execute();
+    $d7_users = $stmt->fetchall();
+    $stmt = NULL;
+    $drupal = NULL;
+
+    drush_log('Request to the Drupal 7 database finished.', 'success');
+    ww_migrate_drupal_insert_user($setups,$d7_users);
+  } catch (PDOException $error) {
+    drush_log('The connexion to the Drupal 7 database failed.', 'error');
+    drush_user_abort();
+  }
+}
+
+/**
+* Function ww_migrate_drupal_prepare_faq()
+*/
+function ww_migrate_drupal_prepare_faq($setups) {
+  try {
+    $drupal = new PDO('mysql:host='.$setups['host'].';dbname='.$setups['database'], $setups['user'], $setups['password']);
+    $drupal->exec("SET CHARACTER SET utf8");
+
+    $stmt = $drupal->prepare('SELECT DISTINCT
+                              n.title,
+                              bd.body_value,
+                              td.name AS term_name,
+                              td.language AS term_language,
+                              n.created,
+                              n.language
+                              FROM node AS n
+                              LEFT OUTER JOIN field_data_body AS bd ON bd.entity_id = n.nid
+                              LEFT OUTER JOIN field_data_field_category_faq AS cat ON cat.entity_id = n.nid
+                              LEFT OUTER JOIN taxonomy_term_data AS td ON td.tid = cat.field_category_faq_tid
+                              WHERE n.type = "faq"
+                              AND n.status = 1
+                              ORDER BY n.created
+                              DESC;
+                            ');
+
+    $stmt->execute();
+    $d7_faq = $stmt->fetchall();
+    $stmt = NULL;
+    $drupal = NULL;
+
+    drush_log('Request to the Drupal 7 database finished.', 'success');
+    ww_migrate_drupal_insert_faq($setups,$d7_faq);
+  } catch (PDOException $error) {
+    drush_log('The connexion to the Drupal 7 database failed.', 'error');
+    drush_user_abort();
+  }
+}
+
+/**
+* Function ww_migrate_drupal_prepare_content()
+*/
+function ww_migrate_drupal_prepare_content($setups) {
+  try {
+    $drupal = new PDO('mysql:host='.$setups['host'].';dbname='.$setups['database'], $setups['user'], $setups['password']);
+    $drupal->exec("SET CHARACTER SET utf8");
+
+    $stmt = $drupal->prepare('SELECT DISTINCT
+                              n.title,
+                              fpu.field_url,
+                              ft.field_title_value,
+                              fm.uri AS logo,
+                              n.created,
+                              n.language,
+                              u.name AS author
+                              FROM node AS n
+                              LEFT OUTER JOIN field_data_field_url AS fpu ON fpu.entity_id = n.nid
+                              LEFT OUTER JOIN field_data_field_title AS ft ON ft.entity_id = n.nid
+                              LEFT OUTER JOIN field_data_field_logo AS lg ON lg.entity_id = n.nid
+                              LEFT OUTER JOIN file_managed AS fm ON fm.fid = lg.field_logo_fid
+                              LEFT OUTER JOIN users AS u ON u.uid = n.uid
+                              WHERE n.type = "content"
+                              AND n.status = 1
+                              ORDER BY n.created
+                              DESC;
+                            ');
+
+    $stmt->execute();
+    $d7_content = $stmt->fetchall();
+    $stmt = NULL;
+    $drupal = NULL;
+
+    drush_log('Request to the Drupal 7 database finished.', 'success');
+    ww_migrate_drupal_insert_content($setups,$d7_content);
+  } catch (PDOException $error) {
+    drush_log('The connexion to the Drupal 7 database failed.', 'error');
+    drush_user_abort();
+  }
+}
+
+/**
+* Function ww_migrate_drupal_insert_user()
+*/
+function ww_migrate_drupal_insert_user($setups,$d7_users) {
+  drush_print('User import is launched!');
+
+  foreach($d7_users as $d7_user) {
+    $user_check = user_load_by_name($d7_user['username']);
+
+    if(empty($user_check)):
+      $create_date = date('U', $d7_user['created']);
+      $roles_names = explode(',', $d7_user['roles']);
+      $roles = array();
+
+      foreach($roles_names as $role_name) {
+        $rid = ww_migrate_drupal_get_machine_name($role_name);
+        array_push($roles, $rid);
+      }
+
+      $user = User::create([
+        'name' => $d7_user['username'],
+        'mail' => $d7_user['mail'],
+        'init' => $d7_user['mail'],
+        'created' => $create_date,
+        'langcode' => $d7_user['language'],
+        'preferred_langcode' => $d7_user['language'],
+        'preferred_admin_langcode' => $d7_user['language'],
+        'timezone' => $d7_user['timezone'],
+        'field_job_title' => $d7_user['jobtitle'],
+        'field_first_name' => $d7_user['firstname'],
+        'field_last_name' => $d7_user['lastname'],
+        'status' => 1,
+        'roles' => $roles,
+      ]);
+      $user -> save();
+
+      drush_log(dt('User "@user" is imported.', array('@user' => $d7_user['username'])), 'success');
+    endif;
+  }
+
+  ww_migrate_drupal_menu($setups);
+}
+
+/**
+* Function ww_migrate_drupal_insert_faq()
+*/
+function ww_migrate_drupal_insert_faq($setups,$d7_faq) {
+  $drupal_user = drush_prompt(dt('Which username do you want to use as an author?'));
+  drush_print(dt('I will check if the username "@drupal_user" exist inside your Drupal 8 database.', array('@drupal_user' =>  $drupal_user)));
+  $user = user_load_by_name($drupal_user);
+
+  if($user):
+    drush_log(dt('The username "@drupal_user" exist inside your Drupal 8 database.', array('@drupal_user' =>  $drupal_user)), 'success');
+    drush_print('FAQ import is launched!');
+
+    foreach($d7_faq as $faq) {
+      $title = ww_migrate_drupal_clean_data($faq['title']);
+      $create_date = date('U', $faq['created']);
+      $dom = new domDocument;
+      $dom->loadHTML($faq['body_value']);
+      $dom->preserveWhiteSpace = false;
+      $images = $dom->getElementsByTagName('img');
+
+      foreach($images as $img) {
+        $url_image = $img->getAttribute('src');
+        $data_image = file_get_contents($url_image);
+        $path_file_image = pathinfo($url_image);
+        $path_file_image['dirname'] = str_replace('http://your_url.com', '', $path_file_image['dirname']);
+        $public_path = Drupal::service('file_system')->realpath(file_default_scheme() . "://");
+
+        if(!is_dir($public_path.'/'.$path_file_image['dirname'])):
+          Drupal::service('file_system')->mkdir('public://'.$path_file_image['dirname'], NULL, TRUE, NULL);
+        endif;
+
+        $file_image = file_save_data($data_image, 'public://'.$path_file_image['dirname'].'/'.$path_file_image['basename'], FILE_EXISTS_REPLACE);
+      }
+
+      $content = str_replace('src="http://your_url.com/', 'src="/sites/default/files/', $faq['body_value']);
+      $content = preg_replace('/<a href=\"(.*?)\">(.*?)<\/a>/', "\\2", $content);
+      $content = ww_migrate_drupal_clean_data($content);
+      $term_faq_name = ww_migrate_drupal_clean_data($faq['term_name']);
+      $term_faq_language = $faq['term_language'];
+      $category_faq_tid = array();
+
+      $category_check = Drupal::entityTypeManager()->getStorage('taxonomy_term')->loadByProperties([
+        'name' => $term_faq_name,
+        'vid' => 'faq'
+      ]);
+
+      if(empty($category_check)):
+        $term = Term::create([
+          'name' => $term_faq_name,
+          'vid' => 'faq',
+          'langcode' => $term_faq_language,
+        ]);
+        $term->save();
+        array_push($category_faq_tid, (int)$term->id());
+      else:
+        array_push($category_faq_tid, (int)current($category_check)->id());
+      endif;
+
+      $category_faq_tid = array_unique($category_faq_tid);
+      $category_faq_tid = array_values($category_faq_tid);
+
+      $faq_check = Drupal::entityTypeManager()->getStorage('node')->loadByProperties([
+        'title' => $title,
+        'type' => 'faq'
+      ]);
+
+      if(empty($faq_check)):
+        $node = Node::create([
+          'type'            => 'faq',
+          'title'           => $title,
+          'field_body'      => [
+            'value'         => $content,
+            'format'        => 'full_html',
+          ],
+          'field_category'  => $category_faq_tid,
+          'langcode'        => $faq['language'],
+          'status'          => 1,
+          'uid'             => $user->id(),
+          'created'         => $create_date
+        ]);
+
+        $node->save();
+        drush_log(dt('FAQ called "@faq" is imported.', array('@faq' => $faq['title'])), 'success');
+      endif;
+    }
+
+    ww_migrate_drupal_menu($setups);
+  else:
+    drush_log(dt('The username "@drupal_user" doesn\'t exist inside your Drupal 8 database.', array('@drupal_user' =>  $drupal_user)), 'error');
+    ww_migrate_drupal_menu($setups);
+  endif;
+}
+
+/**
+* Function ww_migrate_drupal_insert_content()
+*/
+function ww_migrate_drupal_insert_content($setups,$d7_content) {
+  drush_log(dt('The username "@drupal_user" exist inside your Drupal 8 database.', array('@drupal_user' =>  $drupal_user)), 'success');
+  drush_print('Content import is launched!');
+
+  foreach($d7_content as $content) {
+    $title = ww_migrate_drupal_clean_data($content['title']);
+    $field_url = ww_migrate_drupal_clean_data($content['field_play_url_url']);
+    $field_title_value = ww_migrate_drupal_clean_data($content['field_title_value']);
+    $create_date = date('U', $content['created']);
+
+    if(!empty($content['logo'])):
+      $path_file = pathinfo($content['logo']);
+      $data = file_get_contents('http://your_url.com/sites/default/files/'.$path_file['basename']);
+      $file_logo = file_save_data($data, 'public://'.$path_file['basename'], FILE_EXISTS_REPLACE);
+      $file_logo = $file_logo->id();
+    else:
+      $file_logo = NULL;
+    endif;
+
+    $author = user_load_by_name($content['author']);
+    if(!$author):
+      $author = user_load_by_name('your_author');
+    endif;
+
+    $content_check = Drupal::entityTypeManager()->getStorage('node')->loadByProperties([
+      'title' => $title,
+      'type' => 'content'
+    ]);
+
+    if(empty($content_check)):
+      $node = Node::create([
+        'type'            => 'content',
+        'title'           => $title,
+        'field_url'       => $field_url,
+        'field_title'     => $field_title_value,
+        'field_logo'      => [
+          'target_id'     => $file_logo,
+          'alt'           => $title,
+          'title'         => $title
+        ],
+        'langcode'        => $content['language'],
+        'status'          => 1,
+        'uid'             => $author->id(),
+        'created'         => $create_date
+      ]);
+
+      $node->save();
+      drush_log(dt('Content called "@content" is imported.', array('@content' => $content['title'])), 'success');
+    endif;
+  }
+
+  ww_migrate_drupal_menu($setups);
+}
+
+/**
+* Function ww_migrate_drupal_clean_data()
+*/
+function ww_migrate_drupal_clean_data($data) {
+  $data = trim($data);
+  $data = ucfirst($data);
+  return $data;
+}
+
+/**
+* Function ww_migrate_drupal_get_machine_name()
+*/
+function ww_migrate_drupal_get_machine_name($data) {
+  $data = trim($data);
+  $data = str_replace(' ','_',$data);
+  $data = str_replace('-','_',$data);
+  $data = strtolower($data);
+  return $data;
+}

@@ -1,0 +1,5 @@
+name: WW migrate Drupal
+type: module
+description: Migrate data from Drupal 7.
+core: 8.x
+package: WW Modules
